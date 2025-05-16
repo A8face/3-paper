@@ -1,0 +1,286 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import mean_absolute_error, r2_score
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torchvision.models import resnet18
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+# 忽略警告信息
+warnings.filterwarnings("ignore")
+
+def load_and_preprocess_data(file_path, img_root):
+    """
+    加载数据并进行预处理
+    """
+    # 尝试不同的编码方式读取CSV文件
+    encodings = ['utf-8', 'gbk', 'gb2312']
+    df = None
+    
+    for encoding in encodings:
+        try:
+            # 尝试读取文件，跳过前两行（如果有标题或空行）
+            df = pd.read_csv(file_path, encoding=encoding, skiprows=2)
+            break  # 如果成功读取，跳出循环
+        except UnicodeDecodeError:
+            continue  # 尝试下一个编码
+    
+    if df is None:
+        raise Exception("无法以支持的编码格式读取文件")
+    
+    # 打印列名以供检查
+    print("DataFrame列名:", df.columns.tolist())
+    
+    # 假设实际数据从第一列开始，并手动重命名列以匹配代码中的预期
+    # 根据实际文件结构调整列名映射
+    df.columns = [
+        '环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', 
+        '孔径mm', '接触角CA/°', '输出', 'q/kW·m-2', 
+        '壁面过热度△T/K', 'HTC/kW·m1'
+    ]
+    
+    # 确保所有相关列的数据类型为字符串
+    for col in ['环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']:
+        df[col] = df[col].astype(str)
+    
+    # 检查必要列是否存在
+    required_columns = ['环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°', 'q/kW·m-2', '壁面过热度△T/K', 'HTC/kW·m1']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        raise ValueError(f"CSV 文件中缺失必要的列: {', '.join(missing_columns)}")
+    
+    # 解析环境参数
+    def parse_environment(env_str):
+        params = {}
+        if "atm" in env_str:
+            params["pressure"] = float(env_str.split("atm")[0].strip())
+        if "密度:" in env_str:
+            density_str = env_str.split("密度:")[1].split("g/cm3")[0].strip()
+            params["density"] = float(density_str)
+        if "工质：" in env_str:
+            fluid = env_str.split("工质：")[1].split(";")[0].strip()
+            params["fluid"] = 0 if fluid == "去离子水" else 1
+        return np.array([params.get("pressure", 0.0), params.get("density", 0.0), params.get("fluid", 0)])
+
+    # 填充环境参数列
+    df["env_params"] = [
+        parse_environment(val) if "下同" not in val else None 
+        for val in df["环境参数"]
+    ]
+    
+    # 标记系列ID
+    df["series_id"] = (df["SEM"] != df["SEM"].shift()).cumsum()
+    
+    # 特征标准化
+    static_features = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']
+    dynamic_features = ['q/kW·m-2']
+    
+    # 将静态和动态特征列转换为浮点数
+    for feature in static_features + dynamic_features:
+        df[feature] = pd.to_numeric(df[feature], errors='coerce')
+    
+    df[static_features] = StandardScaler().fit_transform(df[static_features])
+    df[dynamic_features] = StandardScaler().fit_transform(df[dynamic_features])
+    
+    return df
+class ThermalDataset(Dataset):
+    def __init__(self, df, img_root, transform=None):
+        self.df = df
+        self.img_root = Path(img_root)
+        self.transform = transform
+        self.sem_cache = {}  # 缓存加载的SEM图像
+        self.series_data = df.groupby('series_id')
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        series_id = row['series_id']
+        
+        # 加载SEM图像（带缓存）
+        if series_id not in self.sem_cache:
+            img_path = self.img_root / row['SEM']
+            if not img_path.exists():
+                raise FileNotFoundError(f"图像文件不存在: {img_path}")
+            img = Image.open(img_path)
+            if self.transform:
+                img = self.transform(img)
+            self.sem_cache[series_id] = img
+        
+        # 提取特征
+        static = torch.tensor(row[static_features].values.astype(np.float32))
+        dynamic = torch.tensor(row[dynamic_features].values.astype(np.float32))
+        env = torch.tensor(row['env_params'], dtype=torch.float32)
+        targets = torch.tensor([row['壁面过热度△T/K'], row['HTC/kW·m1']], dtype=torch.float32)
+        
+        return {
+            'image': self.sem_cache[series_id],
+            'static': static,
+            'dynamic': dynamic,
+            'env': env,
+            'targets': targets
+        }
+class MultiTaskThermalModel(nn.Module):
+    """
+    多任务学习模型
+    """
+    def __init__(self):
+        super().__init__()
+        # 图像特征提取
+        self.cnn = resnet18(pretrained=True)
+        self.cnn.fc = nn.Linear(self.cnn.fc.in_features, 256)
+        
+        # 表格特征处理
+        self.static_fc = nn.Sequential(
+            nn.Linear(5, 64), 
+            nn.ReLU(), 
+            nn.Dropout(0.2)
+        )
+        self.dynamic_fc = nn.Linear(1, 16)
+        self.env_fc = nn.Linear(3, 32)
+        
+        # 多任务预测头
+        self.ΔT_head = nn.Sequential(
+            nn.Linear(256 + 64 + 16 + 32, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        self.HTC_head = nn.Sequential(
+            nn.Linear(256 + 64 + 16 + 32, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        # 图像分支
+        img_feat = self.cnn(x['image'])
+        
+        # 表格分支
+        static_feat = self.static_fc(x['static'])
+        dynamic_feat = self.dynamic_fc(x['dynamic'])
+        env_feat = self.env_fc(x['env'])
+        
+        # 特征融合
+        fused = torch.cat([
+            img_feat, static_feat, dynamic_feat, env_feat
+        ], dim=1)
+        
+        # 多任务输出
+        ΔT = self.ΔT_head(fused)
+        HTC = self.HTC_head(fused)
+        
+        return torch.cat([ΔT, HTC], dim=1)
+
+def evaluate(model, dataloader):
+    """
+    模型评估函数
+    """
+    model.eval()
+    ΔT_preds, ΔT_true = [], []
+    HTC_preds, HTC_true = [], []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
+            outputs = model(inputs).cpu().numpy()
+            targets = batch['targets'].numpy()
+            
+            ΔT_preds.extend(outputs[:, 0])
+            ΔT_true.extend(targets[:, 0])
+            HTC_preds.extend(outputs[:, 1])
+            HTC_true.extend(targets[:, 1])
+    
+    metrics = {
+        'ΔT_MAE': mean_absolute_error(ΔT_true, ΔT_preds),
+        'HTC_R2': r2_score(HTC_true, HTC_preds)
+    }
+    return metrics
+
+# 配置参数
+file_path = r"C:\Users\lenovo\Desktop\新建文件夹\论文3\副本3-泡沫结构PPI10-60.csv"
+img_root = "SEM_images/"
+batch_size = 32
+num_workers = 0
+num_epochs = 100
+lr = 1e-4
+weight_decay = 1e-5
+
+# 全局变量
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 数据预处理
+static_features = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']
+dynamic_features = ['q/kW·m-2']
+df = load_and_preprocess_data(file_path, img_root)
+
+# 图像预处理
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485], std=[0.229])
+])
+
+# 数据集和数据加载器
+dataset = ThermalDataset(df, img_root, transform=transform)
+dataloader = DataLoader(
+    dataset, 
+    batch_size=batch_size, 
+    shuffle=True, 
+    num_workers=num_workers
+)
+
+# 模型、优化器和损失函数
+model = MultiTaskThermalModel().to(device)
+optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3)
+criterion = nn.MSELoss()
+weights = torch.tensor([0.3, 0.7]).to(device)
+
+def weighted_mse(pred, target):
+    loss = (pred - target) ** 2
+    return (loss * weights).mean()
+
+# 梯度缩放器
+scaler = GradScaler()
+
+# 训练循环
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0
+    
+    for batch in dataloader:
+        inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
+        labels = batch['targets'].to(device)
+        
+        optimizer.zero_grad()
+        
+        with autocast():
+            outputs = model(inputs)
+            loss = weighted_mse(outputs, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        epoch_loss += loss.item()
+    
+    # 学习率调整
+    avg_loss = epoch_loss / len(dataloader)
+    scheduler.step(avg_loss)
+    
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+
+# 使用示例
+val_metrics = evaluate(model, dataloader)
+print(f"Validation Metrics: {val_metrics}")
