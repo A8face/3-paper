@@ -6,130 +6,98 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
 from torch.cuda.amp import autocast, GradScaler
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error, median_absolute_error
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision.models import resnet18
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 import warnings
+import os
+import matplotlib.pyplot as plt
 
 # 忽略警告信息
 warnings.filterwarnings("ignore")
 
+
 def load_and_preprocess_data(file_path, img_root):
     """
-    加载数据并进行预处理
+    加载数据并进行预处理（修正列名和特征选择）
     """
-    # 尝试不同的编码方式读取CSV文件
-    encodings = ['utf-8', 'gbk', 'gb2312']
-    df = None
-    
-    for encoding in encodings:
-        try:
-            # 尝试读取文件，跳过前两行（如果有标题或空行）
-            df = pd.read_csv(file_path, encoding=encoding, skiprows=2)
-            break  # 如果成功读取，跳出循环
-        except UnicodeDecodeError:
-            continue  # 尝试下一个编码
-    
-    if df is None:
-        raise Exception("无法以支持的编码格式读取文件")
-    
-    # 打印列名以供检查
-    print("DataFrame列名:", df.columns.tolist())
-    
-    # 假设实际数据从第一列开始，并手动重命名列以匹配代码中的预期
-    # 根据实际文件结构调整列名映射
+    # 读取CSV文件
+    df = pd.read_csv(file_path, encoding='GBK')
+
+    # 转换为数值类型
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 修正列名为8列（前6输入，后2输出）
     df.columns = [
-        '环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', 
-        '孔径mm', '接触角CA/°', '输出', 'q/kW·m-2', 
-        '壁面过热度△T/K', 'HTC/kW·m1'
+        '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°',
+        'q/kW·m-2', '壁面过热度△T/K', 'HTC/kW·m1'
     ]
-    
-    # 确保所有相关列的数据类型为字符串
-    for col in ['环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']:
-        df[col] = df[col].astype(str)
-    
-    # 检查必要列是否存在
-    required_columns = ['环境参数', 'SEM', '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°', 'q/kW·m-2', '壁面过热度△T/K', 'HTC/kW·m1']
-    missing_columns = [col for col in required_columns if col not in df.columns]
 
-    if missing_columns:
-        raise ValueError(f"CSV 文件中缺失必要的列: {', '.join(missing_columns)}")
+    # 定义输入输出列
+    input_columns = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°', 'q/kW·m-2']
+    output_columns = ['壁面过热度△T/K', 'HTC/kW·m1']
     
-    # 解析环境参数
-    def parse_environment(env_str):
-        params = {}
-        if "atm" in env_str:
-            params["pressure"] = float(env_str.split("atm")[0].strip())
-        if "密度:" in env_str:
-            density_str = env_str.split("密度:")[1].split("g/cm3")[0].strip()
-            params["density"] = float(density_str)
-        if "工质：" in env_str:
-            fluid = env_str.split("工质：")[1].split(";")[0].strip()
-            params["fluid"] = 0 if fluid == "去离子水" else 1
-        return np.array([params.get("pressure", 0.0), params.get("density", 0.0), params.get("fluid", 0)])
+    # 去重（只保留唯一的孔隙密度和厚度组合）
+    df = df.drop_duplicates(subset=['孔隙密度', '厚度'], keep='first')
 
-    # 填充环境参数列
-    df["env_params"] = [
-        parse_environment(val) if "下同" not in val else None 
-        for val in df["环境参数"]
-    ]
-    
-    # 标记系列ID
-    df["series_id"] = (df["SEM"] != df["SEM"].shift()).cumsum()
-    
     # 特征标准化
-    static_features = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']
-    dynamic_features = ['q/kW·m-2']
-    
-    # 将静态和动态特征列转换为浮点数
-    for feature in static_features + dynamic_features:
-        df[feature] = pd.to_numeric(df[feature], errors='coerce')
-    
-    df[static_features] = StandardScaler().fit_transform(df[static_features])
-    df[dynamic_features] = StandardScaler().fit_transform(df[dynamic_features])
-    
-    return df
+    static_features = input_columns[:5]  # 前5个静态特征
+    dynamic_features = input_columns[5:]  # 第6个动态特征
+
+    static_scaler = StandardScaler()
+    df[static_features] = static_scaler.fit_transform(df[static_features])
+
+    dynamic_scaler = StandardScaler()
+    df[dynamic_features] = dynamic_scaler.fit_transform(df[dynamic_features])
+
+    # 构建图像路径（根据去重后的数据）
+    df = df.reset_index(drop=True)
+    df['image_path'] = df.index.map(lambda idx: Path(img_root) / f"图片{idx+1}.jpg")
+
+    return df, static_scaler, dynamic_scaler, static_features, dynamic_features, output_columns
+
+
 class ThermalDataset(Dataset):
-    def __init__(self, df, img_root, transform=None):
+    """保持不变，但确保特征选择正确"""
+    def __init__(self, df, transform=None, static_features=None, dynamic_features=None):
         self.df = df
-        self.img_root = Path(img_root)
         self.transform = transform
-        self.sem_cache = {}  # 缓存加载的SEM图像
-        self.series_data = df.groupby('series_id')
+        self.image_cache = {}
+        self.static_features = static_features
+        self.dynamic_features = dynamic_features
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        series_id = row['series_id']
+        img_path = row['image_path']
         
-        # 加载SEM图像（带缓存）
-        if series_id not in self.sem_cache:
-            img_path = self.img_root / row['SEM']
+        if img_path not in self.image_cache:
             if not img_path.exists():
                 raise FileNotFoundError(f"图像文件不存在: {img_path}")
-            img = Image.open(img_path)
+            img = Image.open(img_path).convert('RGB')
             if self.transform:
                 img = self.transform(img)
-            self.sem_cache[series_id] = img
+            self.image_cache[img_path] = img
         
-        # 提取特征
-        static = torch.tensor(row[static_features].values.astype(np.float32))
-        dynamic = torch.tensor(row[dynamic_features].values.astype(np.float32))
-        env = torch.tensor(row['env_params'], dtype=torch.float32)
+        static = torch.tensor(row[self.static_features].values.astype(np.float32))
+        dynamic = torch.tensor(row[self.dynamic_features].values.astype(np.float32))
         targets = torch.tensor([row['壁面过热度△T/K'], row['HTC/kW·m1']], dtype=torch.float32)
         
         return {
-            'image': self.sem_cache[series_id],
+            'image': self.image_cache[img_path],
             'static': static,
             'dynamic': dynamic,
-            'env': env,
             'targets': targets
         }
+
+
 class MultiTaskThermalModel(nn.Module):
     """
     多任务学习模型
@@ -147,16 +115,15 @@ class MultiTaskThermalModel(nn.Module):
             nn.Dropout(0.2)
         )
         self.dynamic_fc = nn.Linear(1, 16)
-        self.env_fc = nn.Linear(3, 32)
         
         # 多任务预测头
         self.ΔT_head = nn.Sequential(
-            nn.Linear(256 + 64 + 16 + 32, 128),
+            nn.Linear(256 + 64 + 16, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
         self.HTC_head = nn.Sequential(
-            nn.Linear(256 + 64 + 16 + 32, 128),
+            nn.Linear(256 + 64 + 16, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
@@ -168,11 +135,12 @@ class MultiTaskThermalModel(nn.Module):
         # 表格分支
         static_feat = self.static_fc(x['static'])
         dynamic_feat = self.dynamic_fc(x['dynamic'])
-        env_feat = self.env_fc(x['env'])
         
         # 特征融合
         fused = torch.cat([
-            img_feat, static_feat, dynamic_feat, env_feat
+            img_feat, 
+            static_feat, 
+            dynamic_feat
         ], dim=1)
         
         # 多任务输出
@@ -181,9 +149,10 @@ class MultiTaskThermalModel(nn.Module):
         
         return torch.cat([ΔT, HTC], dim=1)
 
+
 def evaluate(model, dataloader):
     """
-    模型评估函数
+    模型评估函数，返回更多指标
     """
     model.eval()
     ΔT_preds, ΔT_true = [], []
@@ -200,87 +169,365 @@ def evaluate(model, dataloader):
             HTC_preds.extend(outputs[:, 1])
             HTC_true.extend(targets[:, 1])
     
+    # 计算更多指标
     metrics = {
         'ΔT_MAE': mean_absolute_error(ΔT_true, ΔT_preds),
-        'HTC_R2': r2_score(HTC_true, HTC_preds)
+        'ΔT_MSE': mean_squared_error(ΔT_true, ΔT_preds),
+        'ΔT_RMSE': mean_squared_error(ΔT_true, ΔT_preds, squared=False),
+        'ΔT_R2': r2_score(ΔT_true, ΔT_preds),
+        'ΔT_MEDAE': median_absolute_error(ΔT_true, ΔT_preds),
+        
+        'HTC_MAE': mean_absolute_error(HTC_true, HTC_preds),
+        'HTC_MSE': mean_squared_error(HTC_true, HTC_preds),
+        'HTC_RMSE': mean_squared_error(HTC_true, HTC_preds, squared=False),
+        'HTC_R2': r2_score(HTC_true, HTC_preds),
+        'HTC_MEDAE': median_absolute_error(HTC_true, HTC_preds),
     }
+    
+    # 保存预测结果用于绘图
+    model.last_eval_results = {
+        'ΔT_true': np.array(ΔT_true),
+        'ΔT_pred': np.array(ΔT_preds),
+        'HTC_true': np.array(HTC_true),
+        'HTC_pred': np.array(HTC_preds)
+    }
+    
     return metrics
 
-# 配置参数
-file_path = r"C:\Users\lenovo\Desktop\新建文件夹\论文3\副本3-泡沫结构PPI10-60.csv"
-img_root = "SEM_images/"
-batch_size = 32
-num_workers = 0
-num_epochs = 100
-lr = 1e-4
-weight_decay = 1e-5
 
-# 全局变量
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# 数据预处理
-static_features = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°']
-dynamic_features = ['q/kW·m-2']
-df = load_and_preprocess_data(file_path, img_root)
-
-# 图像预处理
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485], std=[0.229])
-])
-
-# 数据集和数据加载器
-dataset = ThermalDataset(df, img_root, transform=transform)
-dataloader = DataLoader(
-    dataset, 
-    batch_size=batch_size, 
-    shuffle=True, 
-    num_workers=num_workers
-)
-
-# 模型、优化器和损失函数
-model = MultiTaskThermalModel().to(device)
-optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3)
-criterion = nn.MSELoss()
-weights = torch.tensor([0.3, 0.7]).to(device)
-
-def weighted_mse(pred, target):
-    loss = (pred - target) ** 2
-    return (loss * weights).mean()
-
-# 梯度缩放器
-scaler = GradScaler()
-
-# 训练循环
-for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0
+def plot_predictions(model, title="Model Predictions"):
+    """绘制预测值与真实值的散点图"""
+    results = model.last_eval_results
     
-    for batch in dataloader:
-        inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
-        labels = batch['targets'].to(device)
-        
-        optimizer.zero_grad()
-        
-        with autocast():
-            outputs = model(inputs)
-            loss = weighted_mse(outputs, labels)
-        
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        
-        epoch_loss += loss.item()
+    # 创建绘图
+    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
     
-    # 学习率调整
-    avg_loss = epoch_loss / len(dataloader)
-    scheduler.step(avg_loss)
+    # 绘制ΔT预测
+    axs[0].scatter(results['ΔT_true'], results['ΔT_pred'], alpha=0.7)
+    axs[0].plot([min(results['ΔT_true']), max(results['ΔT_true'])], 
+                [min(results['ΔT_true']), max(results['ΔT_true'])], 
+                color='red', linestyle='--')
+    axs[0].set_title(f'ΔT Predictions (R²={val_metrics["ΔT_R2"]:.3f})')
+    axs[0].set_xlabel('True Values')
+    axs[0].set_ylabel('Predicted Values')
     
-    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+    # 绘制HTC预测
+    axs[1].scatter(results['HTC_true'], results['HTC_pred'], alpha=0.7)
+    axs[1].plot([min(results['HTC_true']), max(results['HTC_true'])], 
+                [min(results['HTC_true']), max(results['HTC_true'])], 
+                color='red', linestyle='--')
+    axs[1].set_title(f'HTC Predictions (R²={val_metrics["HTC_R2"]:.3f})')
+    axs[1].set_xlabel('True Values')
+    axs[1].set_ylabel('Predicted Values')
+    
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
-# 使用示例
-val_metrics = evaluate(model, dataloader)
-print(f"Validation Metrics: {val_metrics}")
+
+def plot_residuals(model, title="Residual Plots"):
+    """绘制残差图"""
+    results = model.last_eval_results
+    
+    # 计算残差
+    ΔT_residuals = results['ΔT_pred'] - results['ΔT_true']
+    HTC_residuals = results['HTC_pred'] - results['HTC_true']
+    
+    # 创建绘图
+    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # ΔT残差图
+    axs[0, 0].scatter(results['ΔT_pred'], ΔT_residuals, alpha=0.7)
+    axs[0, 0].axhline(y=0, color='red', linestyle='--')
+    axs[0, 0].set_title('ΔT Residuals vs Predicted')
+    axs[0, 0].set_xlabel('Predicted Values')
+    axs[0, 0].set_ylabel('Residuals')
+    
+    # ΔT残差分布
+    axs[0, 1].hist(ΔT_residuals, bins=20, alpha=0.7)
+    axs[0, 1].set_title('ΔT Residuals Distribution')
+    axs[0, 1].set_xlabel('Residuals')
+    axs[0, 1].set_ylabel('Frequency')
+    
+    # HTC残差图
+    axs[1, 0].scatter(results['HTC_pred'], HTC_residuals, alpha=0.7)
+    axs[1, 0].axhline(y=0, color='red', linestyle='--')
+    axs[1, 0].set_title('HTC Residuals vs Predicted')
+    axs[1, 0].set_xlabel('Predicted Values')
+    axs[1, 0].set_ylabel('Residuals')
+    
+    # HTC残差分布
+    axs[1, 1].hist(HTC_residuals, bins=20, alpha=0.7)
+    axs[1, 1].set_title('HTC Residuals Distribution')
+    axs[1, 1].set_xlabel('Residuals')
+    axs[1, 1].set_ylabel('Frequency')
+    
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+def plot_learning_curves(train_losses, val_losses, title="Learning Curves"):
+    """绘制学习曲线"""
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, 'b', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r', label='Validation Loss')
+    plt.title(title)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def train_model(model, train_dataloader, val_dataloader, num_epochs, lr, weight_decay, patience):
+    """训练模型"""
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3)
+    criterion = nn.MSELoss()
+    weights = torch.tensor([0.3, 0.7]).to(device)
+
+    def weighted_mse(pred, target):
+        loss = (pred - target) ** 2
+        return (loss * weights).mean()
+
+    scaler = GradScaler()
+
+    best_loss = float('inf')
+    best_model_weights = None
+    patience_counter = 0
+
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        
+        for batch in train_dataloader:
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
+            labels = batch['targets'].to(device)
+            
+            optimizer.zero_grad()
+            
+            with autocast():
+                outputs = model(inputs)
+                loss = weighted_mse(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+        
+        avg_loss = epoch_loss / len(train_dataloader)
+        train_losses.append(avg_loss)
+        
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_dataloader:
+                inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
+                labels = batch['targets'].to(device)
+                
+                outputs = model(inputs)
+                loss = weighted_mse(outputs, labels)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_dataloader)
+        val_losses.append(avg_val_loss)
+        
+        scheduler.step(avg_val_loss)
+        
+        val_metrics = evaluate(model, val_dataloader)
+        
+        print(f"Epoch {epoch+1}, Train Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Validation Metrics - ΔT: MAE={val_metrics['ΔT_MAE']:.4f}, RMSE={val_metrics['ΔT_RMSE']:.4f}, R2={val_metrics['ΔT_R2']:.4f}")
+        print(f"Validation Metrics - HTC: MAE={val_metrics['HTC_MAE']:.4f}, RMSE={val_metrics['HTC_RMSE']:.4f}, R2={val_metrics['HTC_R2']:.4f}")
+        
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            best_model_weights = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience:
+            print(f"Early stopping after {patience} epochs without improvement.")
+            break
+
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
+
+    return model, train_losses, val_losses
+
+
+def predict_and_visualize(model, dataloader, static_scaler, dynamic_scaler, static_features, dynamic_features):
+    """对完整数据进行预测并可视化"""
+    model.eval()
+    all_preds = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'targets'}
+            outputs = model(inputs).cpu().numpy()
+            all_preds.extend(outputs)
+    
+    all_preds = np.array(all_preds)
+    
+    # 逆标准化
+    ΔT_pred = all_preds[:, 0]
+    HTC_pred = all_preds[:, 1]
+    
+    # 获取原始数据
+    df = dataloader.dataset.df
+    ΔT_true = df['壁面过热度△T/K'].values
+    HTC_true = df['HTC/kW·m1'].values
+    
+    # 绘制预测值与真实值的散点图
+    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+    
+    axs[0].scatter(ΔT_true, ΔT_pred, alpha=0.7)
+    axs[0].plot([min(ΔT_true), max(ΔT_true)], 
+                [min(ΔT_true), max(ΔT_true)], 
+                color='red', linestyle='--')
+    axs[0].set_title(f'ΔT Predictions (R²={r2_score(ΔT_true, ΔT_pred):.3f})')
+    axs[0].set_xlabel('True Values')
+    axs[0].set_ylabel('Predicted Values')
+    
+    axs[1].scatter(HTC_true, HTC_pred, alpha=0.7)
+    axs[1].plot([min(HTC_true), max(HTC_true)], 
+                [min(HTC_true), max(HTC_true)], 
+                color='red', linestyle='--')
+    axs[1].set_title(f'HTC Predictions (R²={r2_score(HTC_true, HTC_pred):.3f})')
+    axs[1].set_xlabel('True Values')
+    axs[1].set_ylabel('Predicted Values')
+    
+    plt.suptitle("Full Data Predictions")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+    
+    # 绘制残差图
+    ΔT_residuals = ΔT_pred - ΔT_true
+    HTC_residuals = HTC_pred - HTC_true
+    
+    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+    
+    axs[0, 0].scatter(ΔT_pred, ΔT_residuals, alpha=0.7)
+    axs[0, 0].axhline(y=0, color='red', linestyle='--')
+    axs[0, 0].set_title('ΔT Residuals vs Predicted')
+    axs[0, 0].set_xlabel('Predicted Values')
+    axs[0, 0].set_ylabel('Residuals')
+    
+    axs[0, 1].hist(ΔT_residuals, bins=20, alpha=0.7)
+    axs[0, 1].set_title('ΔT Residuals Distribution')
+    axs[0, 1].set_xlabel('Residuals')
+    axs[0, 1].set_ylabel('Frequency')
+    
+    axs[1, 0].scatter(HTC_pred, HTC_residuals, alpha=0.7)
+    axs[1, 0].axhline(y=0, color='red', linestyle='--')
+    axs[1, 0].set_title('HTC Residuals vs Predicted')
+    axs[1, 0].set_xlabel('Predicted Values')
+    axs[1, 0].set_ylabel('Residuals')
+    
+    axs[1, 1].hist(HTC_residuals, bins=20, alpha=0.7)
+    axs[1, 1].set_title('HTC Residuals Distribution')
+    axs[1, 1].set_xlabel('Residuals')
+    axs[1, 1].set_ylabel('Frequency')
+    
+    plt.suptitle("Full Data Residuals")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+if __name__ == "__main__":
+    # 配置参数
+    file_path = r"/mnt/c/Users/think/Desktop/论文3/3-泡沫结构PPI10-60 .csv"
+    img_root = r"/mnt/c/Users/think/Desktop/论文3/图片"
+    batch_size = 2  # 调整批次大小以适应小数据集
+    num_workers = 0
+    num_epochs = 100
+    lr = 5e-5  # 调整学习率
+    weight_decay = 1e-5
+    patience = 5  # Early stopping patience
+
+    # 全局变量
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 数据预处理
+    df, static_scaler, dynamic_scaler, static_features, dynamic_features, output_columns = load_and_preprocess_data(file_path, img_root)
+
+    # 检查数据集大小
+    print(f"数据集大小: {len(df)}")
+
+    # 如果数据集大小小于2，不进行划分，直接使用整个数据集进行训练和验证
+    if len(df) < 2:
+        train_df = df
+        val_df = df
+    else:
+        # 数据集划分
+        from sklearn.model_selection import train_test_split
+
+        train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+
+    # 图像预处理
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # 数据集和数据加载器
+    train_dataset = ThermalDataset(
+        train_df, 
+        transform=transform, 
+        static_features=static_features, 
+        dynamic_features=dynamic_features
+    )
+    val_dataset = ThermalDataset(
+        val_df, 
+        transform=transform, 
+        static_features=static_features, 
+        dynamic_features=dynamic_features
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers
+    )
+
+    # 初始化模型
+    model = MultiTaskThermalModel().to(device)
+
+    # 训练模型
+    model, train_losses, val_losses = train_model(model, train_dataloader, val_dataloader, num_epochs, lr, weight_decay, patience)
+
+    # 绘制学习曲线
+    plot_learning_curves(train_losses, val_losses)
+
+    # 对完整数据进行预测并可视化
+    full_dataset = ThermalDataset(
+        df, 
+        transform=transform, 
+        static_features=static_features, 
+        dynamic_features=dynamic_features
+    )
+    full_dataloader = DataLoader(
+        full_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers
+    )
+
+    predict_and_visualize(model, full_dataloader, static_scaler, dynamic_scaler, static_features, dynamic_features)
