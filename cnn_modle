@@ -1885,3 +1885,948 @@ if __name__ == "__main__":
     
     # VAE潜在空间可视化
     visualize_latent_space(model, val_dataloader)
+
+版本4
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torchvision.models import mobilenet_v3_small
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+import umap
+import torch.nn.functional as F
+
+# 数据预处理函数
+def load_and_preprocess_data(file_path, img_root):
+    """
+    加载并预处理数据
+    :param file_path: 数据文件路径
+    :param img_root: 图像文件根目录
+    :return: 预处理后的数据及相关Scaler和特征列表
+    """
+    df = pd.read_csv(file_path, encoding='GBK')
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    df.columns = [
+        '孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°',
+        'q/kW·m-2', '壁面过热度△T/K', 'HTC/kW·m1'
+    ]
+    
+    # 添加新特征
+    df['孔隙密度_厚度'] = df['孔隙密度'] * df['厚度']
+    df['孔隙率_孔径'] = df['孔隙率'] * df['孔隙率']
+    df['HTC/kW·m1'] = np.log1p(df['HTC/kW·m1'])
+    
+    # 确保孔隙密度和厚度为整数
+    df['孔隙密度'] = df['孔隙密度'].astype(int)
+    df['厚度'] = df['厚度'].astype(int)
+    
+    # 验证数据完整性
+    expected_combinations = {
+        (20,1), (30,1), (40,1), (50,1), (60,1),
+        (20,3), (30,3), (40,3), (50,3), (60,3)
+    }
+    
+    actual_combinations = set(zip(df['孔隙密度'], df['厚度']))
+    if actual_combinations - expected_combinations:
+        invalid = actual_combinations - expected_combinations
+        print(f"发现无效组合: {invalid}")
+        raise ValueError("数据中存在无效的孔隙密度和厚度组合")
+    
+    # 生成图像路径
+    unique_combinations = df[['孔隙密度', '厚度']].drop_duplicates().reset_index(drop=True)
+    
+    # 验证组合数量与预期是否一致
+    if len(unique_combinations) != len(expected_combinations):
+        print(f"唯一组合数量: {len(unique_combinations)}")
+        print("唯一组合示例:")
+        print(unique_combinations.head(20))
+        raise ValueError("唯一组合数量与预期不符，请检查数据")
+    
+    image_path_dict = {}
+    for combo_idx, (_, row) in enumerate(unique_combinations.iterrows(), start=1):
+        key = f"{row['孔隙密度']}{row['厚度']}"
+        img_path = Path(img_root) / f"图片{combo_idx}.jpg"
+        
+        if not img_path.exists():
+            available_imgs = [p.name for p in Path(img_root).glob("图片*.jpg")]
+            print(f"现有图片：{available_imgs}")
+            raise FileNotFoundError(f"图像文件不存在: {img_path}，请确认命名规则")
+        
+        image_path_dict[key] = img_path
+    
+    # 为每行数据分配图像路径
+    df['image_path'] = None
+    for idx, row in df.iterrows():
+        key = f"{row['孔隙密度']}{row['厚度']}"
+        try:
+            df.loc[idx, 'image_path'] = image_path_dict[key]
+        except KeyError:
+            print(f"错误行数据：孔隙密度={row['孔隙密度']}，厚度={row['厚度']}")
+            raise
+    
+    # 特征选择与标准化
+    static_features = ['孔隙密度', '厚度', '孔隙率', '孔径mm', '接触角CA/°', '孔隙密度_厚度', '孔隙率_孔径']
+    dynamic_features = ['q/kW·m-2']
+    
+    static_scaler = StandardScaler()
+    df[static_features] = static_scaler.fit_transform(df[static_features])
+    
+    dynamic_scaler = StandardScaler()
+    df[dynamic_features] = dynamic_scaler.fit_transform(df[dynamic_features])
+    
+    df = df.reset_index(drop=True)
+    
+    return df, static_scaler, dynamic_scaler, static_features, dynamic_features
+
+# 数据集类
+class ThermalDataset(Dataset):
+    """
+    热数据集类
+    :param df: 数据DataFrame
+    :param transform: 图像变换
+    :param static_features: 静态特征列表
+    :param dynamic_features: 动态特征列表
+    """
+    def __init__(self, df, transform=None, static_features=None, dynamic_features=None):
+        self.df = df
+        self.transform = transform
+        self.image_cache = {}
+        self.static_features = static_features
+        self.dynamic_features = dynamic_features
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = row['image_path']
+        
+        if img_path not in self.image_cache:
+            img = Image.open(img_path).convert('RGB')
+            if self.transform:
+                img = self.transform(img)
+            self.image_cache[img_path] = img
+        
+        static = torch.tensor(row[self.static_features].values.astype(np.float32))
+        dynamic = torch.tensor(row[self.dynamic_features].values.astype(np.float32))
+        targets = torch.tensor([row['壁面过热度△T/K'], row['HTC/kW·m1']], dtype=torch.float32)
+        
+        return {
+            'image': self.image_cache[img_path],
+            'static': static,
+            'dynamic': dynamic,
+            'targets': targets
+        }
+
+    def get_image_paths(self):
+        return self.df['image_path'].tolist()
+
+# 特征生成器（改进的VAE）
+class FeatureGenerator(nn.Module):
+    """
+    特征生成器（变分自编码器）
+    :param input_dim: 输入维度
+    :param latent_dim: 潜在空间维度
+    """
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128)
+        )
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_logvar = nn.Linear(128, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, input_dim)
+        )
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decoder(z)
+        return recon_x, mu, logvar
+
+# 改进后的模型（结合FroFA和特征生成）
+class EnhancedModelWithVAE(nn.Module):
+    """
+    改进的模型（结合FroFA和特征生成）
+    :param img_feature_dim: 图像特征维度
+    :param latent_dim: 潜在空间维度
+    """
+    def __init__(self, img_feature_dim=512, latent_dim=128):
+        super().__init__()
+        self.mobilenet = mobilenet_v3_small(pretrained=True)
+        self.mobilenet.features[0][0] = nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False)
+        self.mobilenet.classifier[3] = nn.Linear(1024, img_feature_dim)
+        
+        # 静态特征处理
+        self.static_fc = nn.Sequential(
+            nn.Linear(7, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64)
+        )
+        
+        # 动态特征处理
+        self.dynamic_rnn = nn.GRU(input_size=1, hidden_size=16, num_layers=2, batch_first=True)
+        
+        self.dynamic_fc = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 16)
+        )
+        
+        # 特征融合
+        self.fusion = nn.Sequential(
+            nn.Linear(img_feature_dim + 64 + 16, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128)
+        )
+        
+        # 输出层
+        self.deltaT_head = nn.Linear(128, 1)
+        self.htc_head = nn.Linear(128, 1)
+        
+        # 特征生成器
+        self.feature_generator = FeatureGenerator(img_feature_dim, latent_dim)
+
+    def forward(self, x):
+        img = x['image']
+        static = x['static']
+        dynamic = x['dynamic']
+        
+        img_features = self.mobilenet.features(img)
+        img_features = self.mobilenet.avgpool(img_features)
+        img_features = torch.flatten(img_features, 1)
+        img_features = self.mobilenet.classifier(img_features)
+        
+        static_features = self.static_fc(static)
+        
+        dynamic_features, _ = self.dynamic_rnn(dynamic.unsqueeze(-1))
+        dynamic_features = dynamic_features[:, -1, :]
+        dynamic_features = self.dynamic_fc(dynamic_features)
+        
+        recon_img_features, mu, logvar = self.feature_generator(img_features)
+        
+        fused_features = torch.cat([img_features, static_features, dynamic_features], dim=1)
+        fused_features = self.fusion(fused_features)
+        
+        deltaT = self.deltaT_head(fused_features)
+        htc = self.htc_head(fused_features)
+        
+        return deltaT, htc, recon_img_features, mu, logvar
+
+# 训练模型
+def train_model(model, train_dataloader, val_dataloader, num_epochs, lr, weight_decay, patience):
+    """
+    训练模型
+    :param model: 模型
+    :param train_dataloader: 训练数据加载器
+    :param val_dataloader: 验证数据加载器
+    :param num_epochs: 训练轮数
+    :param lr: 学习率
+    :param weight_decay: 权重衰减
+    :param patience: 早停耐心值
+    :return: 训练好的模型和训练历史
+    """
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3)
+    
+    def custom_loss(outputs, labels):
+        deltaT_pred, htc_pred, recon_img_features, mu, logvar = outputs
+        deltaT_true, htc_true = labels[:, 0], labels[:, 1]
+        
+        loss1 = F.mse_loss(deltaT_pred, deltaT_true.unsqueeze(-1))
+        loss2 = F.mse_loss(htc_pred, htc_true.unsqueeze(-1))
+        recon_loss = F.mse_loss(recon_img_features, recon_img_features.detach())
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        vae_loss = recon_loss + 0.01 * kl_div
+        
+        return loss1 + loss2 + vae_loss
+    
+    scaler = GradScaler()
+    best_loss = float('inf')
+    best_model_weights = None
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_ΔT_MAE': [],
+        'val_ΔT_MAE': [],
+        'train_HTC_MAE': [],
+        'val_HTC_MAE': [],
+        'val_ΔT_R2': [],
+        'val_HTC_R2': []
+    }
+    
+    accumulation_steps = 4
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        for i, batch in enumerate(train_dataloader):
+            inputs = batch
+            labels = batch['targets']
+            inputs['image'] = inputs['image'].to(device)
+            inputs['static'] = inputs['static'].to(device)
+            inputs['dynamic'] = inputs['dynamic'].to(device)
+            labels = labels.to(device)
+            
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(inputs)
+                loss = custom_loss(outputs, labels)
+            loss = loss / accumulation_steps
+            scaler.scale(loss).backward()
+            
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            epoch_loss += loss.item() * accumulation_steps
+        
+        avg_loss = epoch_loss / len(train_dataloader)
+        train_losses.append(avg_loss)
+        
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_dataloader:
+                inputs = batch
+                labels = batch['targets']
+                inputs['image'] = inputs['image'].to(device)
+                inputs['static'] = inputs['static'].to(device)
+                inputs['dynamic'] = inputs['dynamic'].to(device)
+                labels = labels.to(device)
+                
+                outputs = model(inputs)
+                loss = custom_loss(outputs, labels)
+                val_loss += loss.item()
+        avg_val_loss = val_loss / len(val_dataloader)
+        val_losses.append(avg_val_loss)
+        
+        history['train_loss'].append(avg_loss)
+        history['val_loss'].append(avg_val_loss)
+        
+        val_metrics = evaluate(model, val_dataloader)
+        history['val_ΔT_MAE'].append(val_metrics['ΔT_MAE'])
+        history['val_ΔT_R2'].append(val_metrics['ΔT_R2'])
+        history['val_HTC_MAE'].append(val_metrics['HTC_MAE'])
+        history['val_HTC_R2'].append(val_metrics['HTC_R2'])
+        
+        scheduler.step(avg_val_loss)
+        
+        print(f"Epoch {epoch+1}, Train Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Validation Metrics - ΔT: MAE={val_metrics['ΔT_MAE']:.4f}, R2={val_metrics['ΔT_R2']:.4f}")
+        print(f"Validation Metrics - HTC: MAE={val_metrics['HTC_MAE']:.4f}, R2={val_metrics['HTC_R2']:.4f}")
+        
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            best_model_weights = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if patience_counter >= patience:
+            print(f"Early stopping after {patience} epochs without improvement.")
+            break
+    
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
+    return model, history
+
+# 绘制预测结果对比图
+def plot_predictions(model, dataloader, save_path=None):
+    """
+    绘制模型预测结果与真实值的对比散点图
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param save_path: 保存路径
+    """
+    model.eval()
+    ΔT_preds, ΔT_true = [], []
+    HTC_preds, HTC_true = [], []
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = batch
+            labels = batch['targets']
+            inputs['image'] = inputs['image'].to(device)
+            inputs['static'] = inputs['static'].to(device)
+            inputs['dynamic'] = inputs['dynamic'].to(device)
+            labels = labels.to(device)
+            
+            deltaT_pred, htc_pred, _, _, _ = model(inputs)
+            ΔT_pred = deltaT_pred.cpu().numpy().flatten()
+            HTC_pred = np.expm1(htc_pred.cpu().numpy().flatten())
+            ΔT_preds.extend(ΔT_pred)
+            ΔT_true.extend(labels[:, 0].cpu().numpy())
+            HTC_preds.extend(HTC_pred)
+            HTC_true.extend(np.expm1(labels[:, 1].cpu().numpy()))
+    
+    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+    
+    if len(ΔT_true) < 2 or len(HTC_true) < 2:
+        print("Not enough data points to plot.")
+        return
+    
+    axs[0].scatter(ΔT_true, ΔT_preds, alpha=0.7)
+    axs[0].plot([min(ΔT_true), max(ΔT_true)], 
+                [min(ΔT_true), max(ΔT_true)], 
+                color='red', linestyle='--')
+    axs[0].set_title(f'ΔT Predictions (R²={r2_score(ΔT_true, ΔT_preds):.3f})')
+    axs[0].set_xlabel('True Values (ΔT/K)')
+    axs[0].set_ylabel('Predicted Values (ΔT/K)')
+    axs[0].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[1].scatter(HTC_true, HTC_preds, alpha=0.7)
+    axs[1].plot([min(HTC_true), max(HTC_true)], 
+                [min(HTC_true), max(HTC_true)], 
+                color='red', linestyle='--')
+    axs[1].set_title(f'HTC Predictions (R²={r2_score(HTC_true, HTC_preds):.3f})')
+    axs[1].set_xlabel('True Values (HTC/kW·m⁻¹)')
+    axs[1].set_ylabel('Predicted Values (HTC/kW·m⁻¹)')
+    axs[1].grid(True, linestyle='--', alpha=0.5)
+    
+    plt.suptitle("Model Predictions")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path / "predictions.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 绘制残差分析图
+def plot_residuals(model, dataloader, save_path=None):
+    """
+    绘制模型预测残差分析图
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param save_path: 保存路径
+    """
+    model.eval()
+    ΔT_preds, ΔT_true = [], []
+    HTC_preds, HTC_true = [], []
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = batch
+            labels = batch['targets']
+            inputs['image'] = inputs['image'].to(device)
+            inputs['static'] = inputs['static'].to(device)
+            inputs['dynamic'] = inputs['dynamic'].to(device)
+            labels = labels.to(device)
+            
+            deltaT_pred, htc_pred, _, _, _ = model(inputs)
+            ΔT_pred = deltaT_pred.cpu().numpy().flatten()
+            HTC_pred = np.expm1(htc_pred.cpu().numpy().flatten())
+            ΔT_preds.extend(ΔT_pred)
+            ΔT_true.extend(labels[:, 0].cpu().numpy())
+            HTC_preds.extend(HTC_pred)
+            HTC_true.extend(np.expm1(labels[:, 1].cpu().numpy()))
+    
+    ΔT_residuals = np.array(ΔT_preds) - np.array(ΔT_true)
+    HTC_residuals = np.array(HTC_preds) - np.array(HTC_true)
+    
+    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+    axs[0, 0].scatter(ΔT_preds, ΔT_residuals, alpha=0.7)
+    axs[0, 0].axhline(y=0, color='red', linestyle='--')
+    axs[0, 0].set_title('ΔT Residuals vs Predicted')
+    axs[0, 0].set_xlabel('Predicted Values (ΔT/K)')
+    axs[0, 0].set_ylabel('Residuals')
+    axs[0, 0].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[0, 1].hist(ΔT_residuals, bins=20, alpha=0.7)
+    axs[0, 1].set_title('ΔT Residuals Distribution')
+    axs[0, 1].set_xlabel('Residuals')
+    axs[0, 1].set_ylabel('Frequency')
+    axs[0, 1].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[1, 0].scatter(HTC_preds, HTC_residuals, alpha=0.7)
+    axs[1, 0].axhline(y=0, color='red', linestyle='--')
+    axs[1, 0].set_title('HTC Residuals vs Predicted')
+    axs[1, 0].set_xlabel('Predicted Values (HTC/kW·m⁻¹)')
+    axs[1, 0].set_ylabel('Residuals')
+    axs[1, 0].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[1, 1].hist(HTC_residuals, bins=20, alpha=0.7)
+    axs[1, 1].set_title('HTC Residuals Distribution')
+    axs[1, 1].set_xlabel('Residuals')
+    axs[1, 1].set_ylabel('Frequency')
+    axs[1, 1].grid(True, linestyle='--', alpha=0.5)
+    
+    plt.suptitle("Residual Plots")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path / "residuals.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 可视化图像与预测结果
+def visualize_predictions_with_images(model, dataloader, num_samples=5, save_path=None):
+    """
+    可视化图像与预测结果对比
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param num_samples: 显示样本数量
+    :param save_path: 保存路径
+    """
+    model.eval()
+    dataset = dataloader.dataset
+    indices = np.random.choice(len(dataset), num_samples)
+    
+    fig = plt.figure(figsize=(15, 3*num_samples))
+    inv_normalize = transforms.Normalize(
+        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+        std=[1/0.229, 1/0.224, 1/0.225]
+    )
+    
+    for i, idx in enumerate(indices):
+        sample = dataset[idx]
+        img = sample['image'].cpu().unsqueeze(0)
+        img = inv_normalize(img).squeeze(0).permute(1, 2, 0).numpy()
+        
+        inputs = {
+            'image': sample['image'].unsqueeze(0).to(device),
+            'static': sample['static'].unsqueeze(0).to(device),
+            'dynamic': sample['dynamic'].unsqueeze(0).to(device)
+        }
+        
+        with torch.no_grad():
+            deltaT_pred, htc_pred, *_ = model(inputs)
+        
+        plt.subplot(num_samples, 2, 2*i+1)
+        plt.imshow(img.clip(0, 1))
+        plt.axis('off')
+        plt.title(f"Sample {idx+1}")
+        
+        plt.subplot(num_samples, 2, 2*i+2)
+        bars = plt.barh(
+            ['ΔT Pred', 'ΔT True', 'HTC Pred', 'HTC True'],
+            [
+                deltaT_pred.item(),
+                sample['targets'][0].item(),
+                np.expm1(htc_pred.item()),
+                np.expm1(sample['targets'][1].item())
+            ]
+        )
+        bars[0].set_color('orange')
+        bars[2].set_color('red')
+        plt.xlim(0, max(
+            deltaT_pred.item(),
+            sample['targets'][0].item(),
+            np.expm1(htc_pred.item()),
+            np.expm1(sample['targets'][1].item())
+        ) * 1.2)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path / "image_predictions.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 绘制特征重要性分析
+def plot_feature_importance(model, dataloader, feature_names, save_path=None):
+    """
+    绘制特征重要性分析图
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param feature_names: 特征名称列表
+    :param save_path: 保存路径
+    """
+    model.eval()
+    baseline_metrics = evaluate(model, dataloader)
+    baseline_score = baseline_metrics['ΔT_R2'] + baseline_metrics['HTC_R2']
+    
+    importance_scores = []
+    for feat_idx in range(len(feature_names)):
+        perturbed_df = dataloader.dataset.df.copy()
+        perturbed_df[feature_names[feat_idx]] = np.random.randn(len(perturbed_df))
+        
+        perturbed_dataset = ThermalDataset(
+            perturbed_df,
+            transform=dataloader.dataset.transform,
+            static_features=dataloader.dataset.static_features,
+            dynamic_features=dataloader.dataset.dynamic_features
+        )
+        perturbed_dataloader = DataLoader(
+            perturbed_dataset,
+            batch_size=dataloader.batch_size,
+            shuffle=False
+        )
+        
+        metrics = evaluate(model, perturbed_dataloader)
+        importance_scores.append(baseline_score - (metrics['ΔT_R2'] + metrics['HTC_R2']))
+    
+    sorted_idx = np.argsort(importance_scores)
+    plt.figure(figsize=(10, 6))
+    plt.barh(range(len(feature_names)), np.array(importance_scores)[sorted_idx])
+    plt.yticks(range(len(feature_names)), np.array(feature_names)[sorted_idx])
+    plt.title('Feature Importance Analysis')
+    plt.xlabel('Importance Score (ΔR²)')
+    plt.ylabel('Static Features')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path / "feature_importance.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 绘制训练指标历史变化
+def plot_metrics_history(history, save_path=None):
+    """
+    绘制训练过程中的指标变化历史
+    :param history: 训练历史记录
+    :param save_path: 保存路径
+    """
+    fig, axs = plt.subplots(3, 1, figsize=(12, 15))
+    
+    axs[0].plot(history['val_ΔT_MAE'], label='ΔT Val MAE')
+    axs[0].plot(history['val_ΔT_R2'], label='ΔT Val R²')
+    axs[0].set_title('ΔT Metrics History')
+    axs[0].set_xlabel('Epoch')
+    axs[0].legend()
+    axs[0].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[1].plot(history['val_HTC_MAE'], label='HTC Val MAE')
+    axs[1].plot(history['val_HTC_R2'], label='HTC Val R²')
+    axs[1].set_title('HTC Metrics History')
+    axs[1].set_xlabel('Epoch')
+    axs[1].legend()
+    axs[1].grid(True, linestyle='--', alpha=0.5)
+    
+    axs[2].plot(history['train_loss'], label='Train Loss')
+    axs[2].plot(history['val_loss'], label='Val Loss')
+    axs[2].set_title('Loss History')
+    axs[2].set_xlabel('Epoch')
+    axs[2].legend()
+    axs[2].grid(True, linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path / "metrics_history.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 可视化VAE潜在空间
+def visualize_latent_space(model, dataloader, save_path=None):
+    """
+    可视化VAE潜在空间
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param save_path: 保存路径
+    """
+    model.eval()
+    latents = []
+    labels = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = batch
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # 获取潜在空间特征
+            _, _, _, mu, _ = model(inputs)
+            latents.append(mu.cpu().numpy())
+            labels.append(inputs['targets'][:, 0].cpu().numpy())
+    
+    latents = np.concatenate(latents)
+    labels = np.concatenate(labels)
+    
+    if len(latents) == 0:
+        print("No data found in latent space.")
+        return
+    
+    if latents.ndim == 1:
+        latents = latents.reshape(-1, 1)
+    
+    reducer = umap.UMAP(n_components=2, n_neighbors=min(10, len(latents)-1))
+    latent_2d = reducer.fit_transform(latents)
+    
+    plt.figure(figsize=(12, 10))
+    scatter = plt.scatter(latent_2d[:, 0], latent_2d[:, 1], c=labels, cmap='viridis', alpha=0.6)
+    plt.colorbar(scatter, label='Wall Superheat ΔT (K)')
+    plt.title('VAE Latent Space Visualization')
+    plt.xlabel('Latent Dimension 1')
+    plt.ylabel('Latent Dimension 2')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    if save_path:
+        plt.savefig(save_path / "latent_space.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 绘制分面回归诊断图
+def plot_faceted_predictions(model, dataloader, save_path=None):
+    """
+    绘制分面回归诊断图
+    :param model: 模型
+    :param dataloader: 数据加载器
+    :param save_path: 保存路径
+    """
+    model.eval()
+    results = []
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs = batch
+            labels = batch['targets']
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            labels = labels.to(device)
+            
+            deltaT_pred, htc_pred, *_ = model(inputs)
+            
+            batch_df = pd.DataFrame({
+                '孔隙密度': inputs['static'][:,0].cpu().numpy(),
+                '厚度': inputs['static'][:,1].cpu().numpy(),
+                'ΔT_true': labels[:,0].cpu().numpy(),
+                'ΔT_pred': deltaT_pred.squeeze().cpu().numpy(),
+                'HTC_true': np.expm1(labels[:,1].cpu().numpy()),
+                'HTC_pred': np.expm1(htc_pred.squeeze().cpu().numpy())
+            })
+            results.append(batch_df)
+    
+    full_df = pd.concat(results)
+    
+    g = sns.FacetGrid(full_df, col="孔隙密度", row="厚度", margin_titles=True, height=3)
+    g.map_dataframe(sns.regplot, x="ΔT_true", y="ΔT_pred", 
+                    scatter_kws={'alpha':0.5, 's':20}, line_kws={'color':'red'})
+    g.set_axis_labels("真实壁面过热度 (K)", "预测壁面过热度 (K)")
+    g.fig.suptitle("分孔隙密度和厚度的ΔT预测效果", y=1.02)
+    
+    plt.figure(figsize=(12,6))
+    sns.jointplot(data=full_df, x="HTC_true", y="HTC_pred", 
+                kind='reg', 
+                marginal_kws={'bins':15, 'kde':True},
+                joint_kws={'scatter_kws': {'alpha':0.5}})
+    plt.suptitle("HTC预测联合分布", y=1.02)
+    
+    deltaT_mae = mean_absolute_error(full_df['ΔT_true'], full_df['ΔT_pred'])
+    htc_r2 = r2_score(full_df['HTC_true'], full_df['HTC_pred'])
+    
+    plt.text(0.1, 0.9, f'ΔT MAE: {deltaT_mae:.2f} K\nHTC R²: {htc_r2:.2f}',
+            transform=plt.gcf().transFigure)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        g.fig.savefig(save_path / "faceted_deltaT.png", dpi=300, bbox_inches='tight')
+        plt.savefig(save_path / "joint_HTC.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+# 定义超参数搜索目标函数
+def objective(trial):
+    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-4, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    
+    df, static_scaler, dynamic_scaler, static_features, dynamic_features = load_and_preprocess_data(file_path, img_root)
+    
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+    
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    train_dataset = ThermalDataset(train_df, transform=train_transform, static_features=static_features, dynamic_features=dynamic_features)
+    val_dataset = ThermalDataset(val_df, transform=val_transform, static_features=static_features, dynamic_features=dynamic_features)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    model = EnhancedModelWithVAE().to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3)
+    
+    def custom_loss(outputs, labels):
+        deltaT_pred, htc_pred, recon_img_features, mu, logvar = outputs
+        deltaT_true, htc_true = labels[:, 0], labels[:, 1]
+        
+        loss1 = F.mse_loss(deltaT_pred, deltaT_true.unsqueeze(-1))
+        loss2 = F.mse_loss(htc_pred, htc_true.unsqueeze(-1))
+        recon_loss = F.mse_loss(recon_img_features, recon_img_features.detach())
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        vae_loss = recon_loss + 0.01 * kl_div
+        
+        return loss1 + loss2 + vae_loss
+
+    scaler = GradScaler()
+    best_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(100):
+        model.train()
+        epoch_loss = 0
+        for batch in train_dataloader:
+            inputs = batch
+            labels = batch['targets']
+            inputs['image'] = inputs['image'].to(device)
+            inputs['static'] = inputs['static'].to(device)
+            inputs['dynamic'] = inputs['dynamic'].to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(inputs)
+                loss = custom_loss(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_loss += loss.item()
+        avg_loss = epoch_loss / len(train_dataloader)
+        
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_dataloader:
+                inputs = batch
+                labels = batch['targets']
+                inputs['image'] = inputs['image'].to(device)
+                inputs['static'] = inputs['static'].to(device)
+                inputs['dynamic'] = inputs['dynamic'].to(device)
+                labels = labels.to(device)
+
+                outputs = model(inputs)
+                loss = custom_loss(outputs, labels)
+                val_loss += loss.item()
+        avg_val_loss = val_loss / len(val_dataloader)
+        scheduler.step(avg_val_loss)
+        
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if patience_counter >= 5:
+            break
+    return best_loss
+
+# 主函数
+if __name__ == "__main__":
+    file_path = r"/mnt/c/Users/think/Desktop/论文3/3-泡沫结构PPI10-60 .csv"
+    img_root = r"/mnt/c/Users/think/Desktop/论文3/图片"
+    num_workers = 0
+    num_epochs = 200
+    patience = 5
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    output_dir = Path(r"/mnt/c/Users/think/Desktop/论文3/predication")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Optuna超参数搜索
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=20)
+    
+    # 输出最佳超参数
+    print("Best trial:")
+    trial = study.best_trial
+    print(f"  Value: {trial.value}")
+    print("  Params: ")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+    
+    # 使用最佳超参数重新训练模型
+    best_params = study.best_params
+    df, static_scaler, dynamic_scaler, static_features, dynamic_features = load_and_preprocess_data(file_path, img_root)
+    
+    train_df, val_df = train_test_split(df, test_size=0.3, random_state=42)
+    
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    train_dataset = ThermalDataset(train_df, transform=train_transform, static_features=static_features, dynamic_features=dynamic_features)
+    val_dataset = ThermalDataset(val_df, transform=val_transform, static_features=static_features, dynamic_features=dynamic_features)
+    train_dataloader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=best_params['batch_size'], shuffle=False)
+    
+    model = EnhancedModelWithVAE().to(device)
+    
+    model, history = train_model(model, train_dataloader, val_dataloader, num_epochs, best_params['lr'], best_params['weight_decay'], patience)
+    
+    # 调用绘图函数
+    plot_metrics_history(history, output_dir)
+    
+    plot_predictions(model, val_dataloader, output_dir)
+    plot_residuals(model, val_dataloader, output_dir)
+    
+    visualize_predictions_with_images(model, val_dataloader, save_path=output_dir)
+    
+    plot_feature_importance(model, val_dataloader, static_features, output_dir)
+    
+    visualize_latent_space(model, val_dataloader, output_dir)
+    
+    plot_faceted_predictions(model, val_dataloader, output_dir)
